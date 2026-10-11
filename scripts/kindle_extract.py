@@ -31,7 +31,7 @@ from pathlib import Path
 import pdfplumber
 
 sys.path.insert(0, str(Path(__file__).parent))
-from kindle_common import (RE_HYPHEN_END, RE_LIST_START, RE_ONLY_PUNCT, RE_SENT_END,  # noqa: E402
+from kindle_common import (RE_HYPHEN_END, RE_LIST_START, RE_ONLY_PUNCT, RE_SENT_END, sanitize_text,  # noqa: E402
                            body_size, detect_repeated_edges, is_page_number, norm_text,
                            pdf_outline, round_size, words_to_lines, which)
 
@@ -319,6 +319,7 @@ def postprocess(blocks: list[dict], report: dict) -> list[dict]:
 # ---------------------------------------------------------------- salida markdown
 
 def clean_text(t: str) -> str:
+    t = sanitize_text(t)
     t = re.sub(r"\s+", " ", t).strip()
     t = t.replace("ﬁ", "fi").replace("ﬂ", "fl").replace("ﬀ", "ff").replace("ﬃ", "ffi")
     t = re.sub(r"\s+([,.;:!?»)])", r"\1", t)

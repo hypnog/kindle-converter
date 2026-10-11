@@ -28,9 +28,20 @@ RE_HYPHEN_END = re.compile(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]-$")
 RE_SENT_END = re.compile(r"[.!?…:;»”\"')\]]\s*$")
 RE_LIST_START = re.compile(r"^\s*(?:[-–—•·▪◦*]|\d{1,3}[.)]|[a-zA-Z][.)])\s+")
 RE_ONLY_PUNCT = re.compile(r"^[\W_]+$")
+# Caracteres que XML 1.0 prohíbe (C0 salvo \t \n \r, y los no-caracteres U+FFFE/U+FFFF).
+# Un solo carácter así vuelve inválido todo el XHTML del capítulo (EPUBCheck: FATAL RSC-016).
+RE_XML_INVALID = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
+# Algunas fuentes de PDF codifican el guion como STX (U+0002) → "Lao\x02Tsé"; el guion
+# blando (U+00AD) es invisible y corta palabras al buscar.
+_CTRL_MAP = {0x02: "-", 0xAD: None}
 
 BOLD_HINTS = ("bold", "black", "heavy", "semibold", "demibold", "extrabold", "-bd", ",b", "negrita")
 ITALIC_HINTS = ("italic", "oblique", "-it", ",i")
+
+
+def sanitize_text(s: str) -> str:
+    """Repara guiones codificados como control y quita caracteres inválidos en XML."""
+    return RE_XML_INVALID.sub("", s.translate(_CTRL_MAP))
 
 
 def is_bold(fontname: str | None) -> bool:

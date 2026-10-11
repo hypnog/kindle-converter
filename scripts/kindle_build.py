@@ -27,12 +27,14 @@ import subprocess
 import sys
 import uuid
 import zipfile
+import xml.etree.ElementTree as ET
+from urllib.parse import unquote
 from pathlib import Path
 
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parent))
-from kindle_common import which  # noqa: E402
+from kindle_common import RE_XML_INVALID, sanitize_text, which  # noqa: E402
 
 KINDLE_CSS = """
 /* Kindle-safe CSS: unidades relativas, sin fuentes embebidas, sin posicionamiento */
@@ -131,7 +133,9 @@ def wrap(text: str, n: int) -> list[str]:
 # ---------------------------------------------------------------- pandoc / fallback
 
 def build_pandoc(md: Path, epub: Path, css: Path, cover: Path | None, toc_depth: int, meta: dict) -> None:
-    cmd = ["pandoc", str(md), "-o", str(epub), "--to", "epub3", "--toc", f"--toc-depth={toc_depth}",
+    # ascii_identifiers: sin esto pandoc genera anclas con tildes (#mártires) que fallan
+    # en EPUBCheck (RSC-012) y pueden romper saltos del índice en algunos lectores.
+    cmd = ["pandoc", str(md), "--from", "markdown+ascii_identifiers", "-o", str(epub), "--to", "epub3", "--toc", f"--toc-depth={toc_depth}",
            "--split-level=1", "--css", str(css), f"--resource-path={md.parent}",
            "--epub-title-page=false", "-M", f"lang={meta.get('lang', 'es')}"]
     if meta.get("title"):
@@ -171,6 +175,20 @@ def build_fallback(md: Path, epub: Path, css_text: str, cover: Path | None, meta
                                    f'<link rel="stylesheet" type="text/css" href="style.css"/></head><body>{ch}</body></html>').encode()
         manifest.append(f'<item id="c{i}" href="{fname}" media-type="application/xhtml+xml"/>')
         spine.append(f'<itemref idref="c{i}"/>')
+    # Tras partir por <h1>, los enlaces "#id" (p. ej. notas al pie de python-markdown, que quedan
+    # todas en el último capítulo) apuntan a otro archivo: reescribirlos como "chNNN.xhtml#id".
+    owner = {}
+    for k, v in files.items():
+        for i_d in re.findall(rb'id="([^"]+)"', v):
+            owner.setdefault(i_d.decode(), k.split("/")[-1])
+    for k in list(files):
+        if not k.endswith(".xhtml"):
+            continue
+        me = k.split("/")[-1]
+        files[k] = re.sub(rb'href="#([^"]+)"',
+                          lambda m: (f'href="{owner[m.group(1).decode()]}#{m.group(1).decode()}"'.encode()
+                                     if owner.get(m.group(1).decode(), me) != me else m.group(0)),
+                          files[k])
     for img in md.parent.glob("images_opt/*"):
         mt = "image/jpeg" if img.suffix == ".jpg" else "image/png"
         files[f"OEBPS/images_opt/{img.name}"] = img.read_bytes()
@@ -184,10 +202,9 @@ def build_fallback(md: Path, epub: Path, css_text: str, cover: Path | None, meta
     files["OEBPS/nav.xhtml"] = (f'<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml" '
                                 f'xmlns:epub="http://www.idpf.org/2007/ops"><head><title>Índice</title></head><body>'
                                 f'<nav epub:type="toc" id="toc"><h1>Índice</h1><ol>{nav_html}</ol></nav></body></html>').encode()
-    for k, (lvl, t, href) in enumerate(nav_items, 1):
-        if lvl <= 2:
-            ncx_points.append(f'<navPoint id="np{k}" playOrder="{k}"><navLabel><text>{html.escape(t)}</text></navLabel>'
-                              f'<content src="{href}"/></navPoint>')
+    for k, (lvl, t, href) in enumerate([n for n in nav_items if n[0] <= 2], 1):  # playOrder sin huecos
+        ncx_points.append(f'<navPoint id="np{k}" playOrder="{k}"><navLabel><text>{html.escape(t)}</text></navLabel>'
+                          f'<content src="{href}"/></navPoint>')
     files["OEBPS/toc.ncx"] = (f'<?xml version="1.0" encoding="utf-8"?><ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">'
                               f'<head><meta name="dtb:uid" content="{uid}"/></head><docTitle><text>{html.escape(title)}</text></docTitle>'
                               f'<navMap>{"".join(ncx_points)}</navMap></ncx>').encode()
@@ -228,6 +245,31 @@ def validate(epub: Path) -> dict:
             rep["toc_entries"] = len(re.findall(r"<a ", toc.group(0))) if toc else 0
             if rep["toc_entries"] == 0:
                 rep["problems"].append("TOC vacío: el Kindle no tendrá índice navegable")
+        # XML bien formado + anclas del índice existentes (lo que antes solo detectaba EPUBCheck)
+        ids: dict[str, set[str]] = {}
+        for n in names:
+            if not n.endswith((".xhtml", ".opf", ".ncx")):
+                continue
+            raw = z.read(n).decode("utf-8", "replace")
+            try:
+                root = ET.fromstring(raw.encode("utf-8"))
+            except ET.ParseError as e:
+                rep["problems"].append(f"XML inválido en {n}: {e}")
+                continue
+            ids[n] = {el.get("id") for el in root.iter() if el.get("id")}
+        base = lambda n: n.rsplit("/", 1)[0] + "/" if "/" in n else ""
+        if nav:
+            navx = z.read(nav[0]).decode("utf-8", "ignore")
+            rotas = []
+            for href in re.findall(r'href="([^"]+#[^"]+)"', navx):
+                f, frag = href.split("#", 1)
+                target = base(nav[0]) + unquote(f)
+                if target in ids and unquote(frag) not in ids[target]:
+                    rotas.append(href)
+                elif not frag.isascii():
+                    rotas.append(href)
+            if rotas:
+                rep["problems"].append(f"{len(rotas)} entradas del índice con anclas inexistentes o no ASCII (ej. {rotas[0]})")
         rep["xhtml_files"] = len([n for n in names if n.endswith(".xhtml") and "nav" not in n])
         rep["images"] = len([n for n in names if re.search(r"\.(jpe?g|png|gif)$", n, re.I)])
         if opf:
@@ -294,6 +336,8 @@ def main():
         return f"![{alt}](images_opt/{dst.name})"
 
     text2 = IMG_RE.sub(_sub, text)
+    ctrl_removed = len(RE_XML_INVALID.findall(text2)) + text2.count("\u00ad")
+    text2 = sanitize_text(text2)
     md_opt = work / "book_build.md"
     md_opt.write_text(text2, encoding="utf-8")
     css = work / "kindle.css"; css.write_text(KINDLE_CSS, encoding="utf-8")
@@ -319,7 +363,8 @@ def main():
 
     rep = validate(epub)
     rep.update({"engine": engine, "images_optimized": img_report, "images_missing": missing,
-                "images_total_kb": sum(i["kb"] for i in img_report), "meta": meta})
+                "images_total_kb": sum(i["kb"] for i in img_report), "meta": meta,
+                "control_chars_fixed": ctrl_removed})
     (epub.parent / (epub.stem + ".build_report.json")).write_text(json.dumps(rep, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"EPUB → {epub} ({rep['size_mb']} MB, motor {engine})")
     print(f"TOC: {rep.get('toc_entries')} entradas | capítulos xhtml: {rep['xhtml_files']} | imágenes: {rep['images']} "
